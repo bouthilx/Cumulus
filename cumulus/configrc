@@ -1,0 +1,10 @@
+if_no_scheduler = option("warn", "ignore", default="warn")
+username = string(default="")
+remote_port = integer(0, 65535, default=9990)
+local_port = integer(0, 65535, default=11110)
+
+[mongodb]
+host = string(default="")
+port = integer(0, 65535, default=27017)
+user = string(default="")
+password = string(default="")

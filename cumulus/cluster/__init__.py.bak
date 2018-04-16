@@ -1,0 +1,178 @@
+import datetime
+import logging
+import os
+import socket
+import time
+
+from .. import config
+from ..ssh import rsync, open_ssh_client, receive, send
+from ..scheduler.base import AbstractScheduler
+
+
+logger = logging.getLogger(__name__)
+
+
+# TODO, maybe the interface of ChildScheduler should have the same status than
+# AbstractScheduler and just save internally the ones particular to each
+# Scheduler. The informations spit out of get_queues do not contains
+# ChildScheduler.status but AbstractScheduler.status after all.
+
+
+class Cluster(object):
+
+    SETUP, SUBMIT, MONITOR, CANCEL, PING, CLOSE = range(6)
+
+    def __init__(self, name, hostnames, username=None, password=None,
+                 lazy=False):
+
+        self.name = name
+
+        self.hostnames = hostnames
+        if username is None:
+            username = config["username"]
+        self.username = username
+        self.password = password
+        self.connected_hostname = None
+        if not lazy:
+            self.start_remote_server()
+
+    def start_remote_server(self):
+        logger.debug("Starting remote socket server")
+        if self.connected_hostname is not None:
+            raise RuntimeError("Remote socket server already started")
+
+        # open socket server on cluster
+        # use sockets to requests info from cluster
+        hostname, ssh_client = open_ssh_client(
+            self.hostnames, self.username, self.password)
+        _, stdout, stderr = ssh_client.exec_command(
+            "nohup %(home)s/cumulus/cumulus/bin/cumulus-particle "
+            "--work-on cumulus cumulus-socket open --port %(port)d -vv"
+            ">>%(home)s/cumulus-%(name)s-open-socket.log 2>&1 </dev/null &" %
+            dict(home=os.environ["HOME"], name=self.name,
+                 port=config["port"]))
+        logger.debug("SSH-client STDOUT: %s" % stdout.read())
+        logger.debug("SSH-client STDERR: %s" % stderr.read())
+        # ssh_client.close()
+
+        self.connected_hostname = hostname
+
+        MAX_WAIT = 5 * 60
+        WAIT_STEP = 10
+        waited = 0
+        while waited <= MAX_WAIT:
+            try:
+                s = self.get_client_socket(resilience=0)
+            except socket.error:
+                time.sleep(WAIT_STEP)
+                waited += WAIT_STEP
+                success = False
+            else:
+                send(s, command=self.PING)
+                send(s, date=str(datetime.datetime.now()))
+                rval = receive(s)
+                s.close()
+                logger.debug("PING: %s" % str(rval))
+                success = True
+                break
+
+        if success:
+            logger.debug("Remote socket server ready.")
+        else:
+            raise RuntimeError("Failed to start remote server.")
+
+    def close_remote_server(self):
+        logger.debug("Closing remote socket server")
+
+        if self.connected_hostname is None:
+            raise RuntimeError("No remote server started")
+
+        try:
+            feedback = self._command(self.CLOSE, resilience=0)
+        except socket.error:
+            logger.warning("Tried to close remote socket server %s but it was "
+                           "inaccessible." % self.connected_hostname)
+        else:
+            logger.debug("Remote socket server closed with message: %s" %
+                         str(feedback))
+        finally:
+            self.connected_hostname = None
+
+    def __del__(self):
+        if self.connected_hostname is not None:
+            self.close_remote_server()
+
+    def get_client_socket(self, resilience=1):
+        if self.connected_hostname is None:
+            raise RuntimeError("No remote server started")
+
+        logger.debug("Opening a socket")
+        s = socket.socket()          # Create a socket object
+
+        bind_host = "0.0.0.0"
+        bind_port = 0
+        logger.debug("Binding to (%s, %d)" % (bind_host, bind_port))
+        s.bind((bind_host, bind_port))
+
+        host = self.connected_hostname
+        port = config["port"]
+        logger.debug("Connecting to (%s, %d)" % (host, port))
+        s.settimeout(1)
+        try:
+            s.connect((host, port))
+        except socket.error:
+            if resilience <= 0:
+                raise
+
+            logger.debug("Socket connection to server failed. Trying to "
+                         "relaunch the socket server")
+            self.connected_hostname = None
+            self.start_remote_server()
+            s = self.get_client_socket(resilience - 1)
+        finally:
+            s.settimeout(None)
+
+        return s
+
+    def _command(self, command_id, resilience=1, **kwargs):
+        s = self.get_client_socket(resilience)
+        send(s, command=command_id)
+        send(s, **kwargs)
+        response = receive(s)
+        return response
+
+    def setup(self, remote):
+        stdout, stderr = remote.setup()
+
+    def deploy(self, **kwargs):
+        return self._command(self.SUBMIT, **kwargs)
+
+    def queue(self, **kwargs):
+        return self._command(self.MONITOR, **kwargs)["queue"]
+
+    def cancel(self, **kwargs):
+        return self._command(self.CANCEL, **kwargs)
+
+    def get_free_slots(self):
+        jobs = self.get_queues()
+        logger.info("%d jobs found by parser" % len(jobs))
+        submitted_jobs = 0
+        queued_jobs = 0
+        for job in jobs.itervalues():
+            if AbstractScheduler.COMPLETED in job['job_array']:
+                del job['job_array'][AbstractScheduler.COMPLETED]
+            submitted_job_arrays = sum(job['job_array'].itervalues())
+            submitted_jobs += submitted_job_arrays
+            running_jobs = job['job_array'][AbstractScheduler.RUNNING]
+            queued_jobs += (submitted_job_arrays - running_jobs)
+
+        logger.info("%d queued jobs found by parser" % queued_jobs)
+        logger.info("%d submitted_jobs found by parser" % submitted_jobs)
+
+        if queued_jobs < self.threshold:  # and threshold < submitted_jobs:
+            return self.max_jobs - submitted_jobs
+        else:
+            return 0
+
+    def retrieve_logs(self, output_dir):
+        stdout, stderr = rsync(self, output_dir)

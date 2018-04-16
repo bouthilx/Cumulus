@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+
+# usage: $(basename "$0") --work-on [virtualenv-name] [arguments]
+
+export HOME=`getent passwd $USER | cut -d':' -f6`
+source ~/.bashrc
+export PYTHONUNBUFFERED=1
+
+if [ "$1" == "--work-on" ]
+then
+    echo workon $2
+    workon $2
+    # Get rid of --work-on flag in arguments
+    shift
+    # Get rid of --work-on value in arguments
+    shift
+else
+    echo "Not using virtualenvs? Tsss... -_-"
+fi
+
+# DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+# . $DIR/utils.sh
+# 
+# set_host aiur
+
+echo "$USER running on $HOSTNAME:$CLUSTER"
+# echo "accessing mongodb through $HOST"
+export THEANO_FLAGS=lib.cnmem=1
+
+echo ${@:1}
+${@:1}
+
+# commands: 
+#    1. setup
+#    2. run (locally)
+#    3. submit
+#    4. cancel
+#    5. monitor
+
+
+# database:
+#    1. read
+#    2. remove
+#    3. update
+
+
+# research:
+#    1. plot
+#    2. explore
